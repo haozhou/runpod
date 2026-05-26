@@ -1,4 +1,4 @@
-FROM runpod/pytorch:2.8.0-py3.12-cuda12.8.1-devel
+FROM runpod/pytorch:1.0.3-dev-fix-image-vulnerabilities-cu1281-torch290-ubuntu2204
 
 WORKDIR /app
 
