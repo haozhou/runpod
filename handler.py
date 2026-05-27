@@ -75,8 +75,11 @@ print("Model loaded successfully.")
 
 
 # Z-Image 基础模型(非 Turbo)的推荐参数
-DEFAULT_NUM_STEPS = 30        # 推荐 28–50
-DEFAULT_GUIDANCE_SCALE = 4.0  # 推荐 3.0–5.0
+# 可通过环境变量覆盖默认值
+DEFAULT_NUM_STEPS = int(os.getenv("DEFAULT_NUM_STEPS", "40"))         # 推荐 28–50
+DEFAULT_GUIDANCE_SCALE = float(os.getenv("DEFAULT_GUIDANCE_SCALE", "4.0"))  # 推荐 3.0–5.0
+print(f"Default num_inference_steps: {DEFAULT_NUM_STEPS}")
+print(f"Default guidance_scale: {DEFAULT_GUIDANCE_SCALE}")
 
 
 def handler(job):
