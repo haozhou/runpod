@@ -15,26 +15,46 @@ from diffusers import ZImagePipeline
 
 # RunPod model caching 把模型放在 HF cache 标准结构下
 HF_CACHE_ROOT = "/runpod-volume/huggingface-cache/hub"
-# 这里填的字符串必须和 endpoint 设置里 Model 字段填的 HF repo id 完全一致
-MODEL_ID = os.getenv("MODEL_ID", "Tongyi-MAI/Z-Image-Turbo")
+# 这里填的字符串必须和 endpoint 设置里 Model 字段填的 HF repo id 一致
+# 注意:实际缓存的是基础模型 Z-Image(不是 Turbo)
+MODEL_ID = os.getenv("MODEL_ID", "Tongyi-MAI/Z-Image")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def resolve_snapshot_path(model_id: str) -> str:
-    """把 'org/model' 解析成 /runpod-volume/.../snapshots/<hash>/ 的真实路径."""
-    safe_name = "models--" + model_id.replace("/", "--")
-    snapshots_dir = os.path.join(HF_CACHE_ROOT, safe_name, "snapshots")
-    if not os.path.isdir(snapshots_dir):
+def resolve_snapshot_path(model_id: str):
+    """
+    在 HF_CACHE_ROOT 下查找 model_id 对应的最新 snapshot 路径。
+    RunPod 会把目录名小写化,所以做大小写不敏感的匹配。
+    """
+    target = ("models--" + model_id.replace("/", "--")).lower()
+
+    if not os.path.isdir(HF_CACHE_ROOT):
+        raise FileNotFoundError(f"缓存根目录不存在: {HF_CACHE_ROOT}")
+
+    matched_dir = None
+    for d in os.listdir(HF_CACHE_ROOT):
+        if d.lower() == target and os.path.isdir(os.path.join(HF_CACHE_ROOT, d)):
+            matched_dir = d
+            break
+    if matched_dir is None:
+        available = [d for d in os.listdir(HF_CACHE_ROOT) if d.startswith("models--")]
         raise FileNotFoundError(
-            f"未找到缓存目录: {snapshots_dir}\n"
-            f"请确认 endpoint 的 Model 字段填的是 '{model_id}',且 worker 已完成首次缓存。"
+            f"未在 {HF_CACHE_ROOT} 下找到 {model_id} 的缓存目录。"
+            f" 已存在的模型目录: {available}。"
+            f" 请确认 endpoint 的 Model 字段填的是 '{model_id}',且 worker 已完成首次缓存。"
         )
+
+    snapshots_dir = os.path.join(HF_CACHE_ROOT, matched_dir, "snapshots")
+    if not os.path.isdir(snapshots_dir):
+        raise FileNotFoundError(f"snapshots 目录不存在: {snapshots_dir}")
+
     snapshots = [
         d for d in os.listdir(snapshots_dir)
         if os.path.isdir(os.path.join(snapshots_dir, d))
     ]
     if not snapshots:
         raise FileNotFoundError(f"snapshots 目录为空: {snapshots_dir}")
+
     # 有多个 snapshot 时取最新的一个
     snapshots.sort(
         key=lambda d: os.path.getmtime(os.path.join(snapshots_dir, d)),
@@ -55,7 +75,7 @@ pipe = ZImagePipeline.from_pretrained(
 print("Model loaded successfully.")
 
 
-# Z-Image-Turbo 官方推荐区间,可通过环境变量覆盖默认值
+# 推荐区间,可通过环境变量覆盖默认值
 DEFAULT_NUM_STEPS = int(os.getenv("DEFAULT_NUM_STEPS", "30"))               # 推荐 28-50
 DEFAULT_GUIDANCE_SCALE = float(os.getenv("DEFAULT_GUIDANCE_SCALE", "4.0"))  # 推荐 3.0-5.0
 print(f"Default num_inference_steps: {DEFAULT_NUM_STEPS}")
