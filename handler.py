@@ -30,7 +30,7 @@ TORCH_DTYPE = DTYPE_MAP.get(TORCH_DTYPE_STR, torch.float32)
 print(f"Using torch dtype: {TORCH_DTYPE_STR} ({TORCH_DTYPE})")
 
 
-def resolve_snapshot_path(model_id: str):
+def resolve_snapshot_path(model_id):
     """
     在 HF_CACHE_ROOT 下查找 model_id 对应的最新 snapshot 路径。
     RunPod 会把目录名小写化,所以做大小写不敏感的匹配。
@@ -70,8 +70,8 @@ def resolve_snapshot_path(model_id: str):
 MODEL_PATH = resolve_snapshot_path(MODEL_ID)
 if MODEL_PATH is None:
     raise FileNotFoundError(
-        f"未在 {HF_CACHE_ROOT} 下找到 {MODEL_ID} 的缓存。\n"
-        f"请确认 endpoint 的 Model 字段填的是 '{MODEL_ID}',并已完成首次缓存。"
+        "未在 " + HF_CACHE_ROOT + " 下找到 " + MODEL_ID + " 的缓存。"
+        "请确认 endpoint 的 Model 字段填的是 '" + MODEL_ID + "',并已完成首次缓存。"
     )
 
 print(f"Loading model {MODEL_ID} from: {MODEL_PATH}")
@@ -83,7 +83,7 @@ pipe = ZImagePipeline.from_pretrained(
     local_files_only=True,
 ).to(DEVICE)
 
-# 显式关掉 VAE tiling / slicing,1024x1024 不需要,而且 tiling 是这次撕裂最可疑的元凶
+# 显式关掉 VAE tiling / slicing,1024x1024 不需要,tiling 是瓦片拼贴伪影的常见来源
 if hasattr(pipe, "vae"):
     if hasattr(pipe.vae, "disable_tiling"):
         pipe.vae.disable_tiling()
@@ -95,10 +95,9 @@ if hasattr(pipe, "vae"):
 print("Model loaded successfully.")
 
 
-# Z-Image 基础模型(非 Turbo)的推荐参数
-# 可通过环境变量覆盖默认值
-DEFAULT_NUM_STEPS = int(os.getenv("DEFAULT_NUM_STEPS", "40"))               # 推荐 28–50
-DEFAULT_GUIDANCE_SCALE = float(os.getenv("DEFAULT_GUIDANCE_SCALE", "4.0"))  # 推荐 3.0–5.0
+# Z-Image 基础模型(非 Turbo)的推荐参数,可通过环境变量覆盖默认值
+DEFAULT_NUM_STEPS = int(os.getenv("DEFAULT_NUM_STEPS", "40"))               # 推荐 28-50
+DEFAULT_GUIDANCE_SCALE = float(os.getenv("DEFAULT_GUIDANCE_SCALE", "4.0"))  # 推荐 3.0-5.0
 print(f"Default num_inference_steps: {DEFAULT_NUM_STEPS}")
 print(f"Default guidance_scale: {DEFAULT_GUIDANCE_SCALE}")
 
@@ -108,4 +107,57 @@ def handler(job):
         job_input = job.get("input", {})
         prompt = job_input.get("prompt")
         if not prompt:
-            return
+            return {"error": "Missing required field: prompt"}
+
+        negative_prompt = job_input.get("negative_prompt", None)
+        num_inference_steps = int(job_input.get("num_inference_steps", DEFAULT_NUM_STEPS))
+        guidance_scale = float(job_input.get("guidance_scale", DEFAULT_GUIDANCE_SCALE))
+        seed = int(job_input.get("seed", 42))
+
+        # 锁定 1024x1024
+        width = 1024
+        height = 1024
+
+        generator = torch.Generator(device=DEVICE).manual_seed(seed)
+
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
+        start = time.time()
+
+        result = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+        )
+
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
+        elapsed = round(time.time() - start, 2)
+
+        image = result.images[0]
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        image_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        return {
+            "image_base64": image_base64,
+            "width": width,
+            "height": height,
+            "seed": seed,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "dtype": TORCH_DTYPE_STR,
+            "elapsed_seconds": elapsed,
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }
+
+
+runpod.serverless.start({"handler": handler})
