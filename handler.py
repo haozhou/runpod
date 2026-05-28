@@ -13,53 +13,29 @@ import runpod
 from diffusers import ZImagePipeline
 
 
+# RunPod model caching 把模型放在 HF cache 标准结构下
 HF_CACHE_ROOT = "/runpod-volume/huggingface-cache/hub"
-# 注意:用的是基础模型 Z-Image,不是 Turbo
-MODEL_ID = os.getenv("MODEL_ID", "Tongyi-MAI/Z-Image")
+# 这里填的字符串必须和 endpoint 设置里 Model 字段填的 HF repo id 完全一致
+MODEL_ID = os.getenv("MODEL_ID", "Tongyi-MAI/Z-Image-Turbo")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 精度:可通过环境变量切换,默认 fp32 用于诊断撕裂问题
-# 可选:"fp32", "bf16", "fp16"
-TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "fp32").lower()
-DTYPE_MAP = {
-    "fp32": torch.float32,
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-}
-TORCH_DTYPE = DTYPE_MAP.get(TORCH_DTYPE_STR, torch.float32)
-print(f"Using torch dtype: {TORCH_DTYPE_STR} ({TORCH_DTYPE})")
 
-
-def resolve_snapshot_path(model_id):
-    """
-    在 HF_CACHE_ROOT 下查找 model_id 对应的最新 snapshot 路径。
-    RunPod 会把目录名小写化,所以做大小写不敏感的匹配。
-    """
-    target = ("models--" + model_id.replace("/", "--")).lower()
-
-    if not os.path.isdir(HF_CACHE_ROOT):
-        return None
-
-    matched_dir = None
-    for d in os.listdir(HF_CACHE_ROOT):
-        if d.lower() == target and os.path.isdir(os.path.join(HF_CACHE_ROOT, d)):
-            matched_dir = d
-            break
-    if matched_dir is None:
-        return None
-
-    snapshots_dir = os.path.join(HF_CACHE_ROOT, matched_dir, "snapshots")
+def resolve_snapshot_path(model_id: str) -> str:
+    """把 'org/model' 解析成 /runpod-volume/.../snapshots/<hash>/ 的真实路径."""
+    safe_name = "models--" + model_id.replace("/", "--")
+    snapshots_dir = os.path.join(HF_CACHE_ROOT, safe_name, "snapshots")
     if not os.path.isdir(snapshots_dir):
-        return None
-
+        raise FileNotFoundError(
+            f"未找到缓存目录: {snapshots_dir}\n"
+            f"请确认 endpoint 的 Model 字段填的是 '{model_id}',且 worker 已完成首次缓存。"
+        )
     snapshots = [
         d for d in os.listdir(snapshots_dir)
         if os.path.isdir(os.path.join(snapshots_dir, d))
     ]
     if not snapshots:
-        return None
-
-    # 有多个 snapshot 时取最新一个
+        raise FileNotFoundError(f"snapshots 目录为空: {snapshots_dir}")
+    # 有多个 snapshot 时取最新的一个
     snapshots.sort(
         key=lambda d: os.path.getmtime(os.path.join(snapshots_dir, d)),
         reverse=True,
@@ -68,35 +44,19 @@ def resolve_snapshot_path(model_id):
 
 
 MODEL_PATH = resolve_snapshot_path(MODEL_ID)
-if MODEL_PATH is None:
-    raise FileNotFoundError(
-        "未在 " + HF_CACHE_ROOT + " 下找到 " + MODEL_ID + " 的缓存。"
-        "请确认 endpoint 的 Model 字段填的是 '" + MODEL_ID + "',并已完成首次缓存。"
-    )
-
 print(f"Loading model {MODEL_ID} from: {MODEL_PATH}")
 print(f"Using device: {DEVICE}")
 
 pipe = ZImagePipeline.from_pretrained(
     MODEL_PATH,
-    torch_dtype=TORCH_DTYPE,
+    torch_dtype=torch.bfloat16,
     local_files_only=True,
 ).to(DEVICE)
-
-# 显式关掉 VAE tiling / slicing,1024x1024 不需要,tiling 是瓦片拼贴伪影的常见来源
-if hasattr(pipe, "vae"):
-    if hasattr(pipe.vae, "disable_tiling"):
-        pipe.vae.disable_tiling()
-        print("VAE tiling disabled.")
-    if hasattr(pipe.vae, "disable_slicing"):
-        pipe.vae.disable_slicing()
-        print("VAE slicing disabled.")
-
 print("Model loaded successfully.")
 
 
-# Z-Image 基础模型(非 Turbo)的推荐参数,可通过环境变量覆盖默认值
-DEFAULT_NUM_STEPS = int(os.getenv("DEFAULT_NUM_STEPS", "40"))               # 推荐 28-50
+# Z-Image-Turbo 官方推荐区间,可通过环境变量覆盖默认值
+DEFAULT_NUM_STEPS = int(os.getenv("DEFAULT_NUM_STEPS", "30"))               # 推荐 28-50
 DEFAULT_GUIDANCE_SCALE = float(os.getenv("DEFAULT_GUIDANCE_SCALE", "4.0"))  # 推荐 3.0-5.0
 print(f"Default num_inference_steps: {DEFAULT_NUM_STEPS}")
 print(f"Default guidance_scale: {DEFAULT_GUIDANCE_SCALE}")
@@ -108,22 +68,17 @@ def handler(job):
         prompt = job_input.get("prompt")
         if not prompt:
             return {"error": "Missing required field: prompt"}
-
         negative_prompt = job_input.get("negative_prompt", None)
         num_inference_steps = int(job_input.get("num_inference_steps", DEFAULT_NUM_STEPS))
         guidance_scale = float(job_input.get("guidance_scale", DEFAULT_GUIDANCE_SCALE))
         seed = int(job_input.get("seed", 42))
-
         # 锁定 1024x1024
         width = 1024
         height = 1024
-
         generator = torch.Generator(device=DEVICE).manual_seed(seed)
-
         if DEVICE == "cuda":
             torch.cuda.synchronize()
         start = time.time()
-
         result = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -133,16 +88,13 @@ def handler(job):
             guidance_scale=guidance_scale,
             generator=generator,
         )
-
         if DEVICE == "cuda":
             torch.cuda.synchronize()
         elapsed = round(time.time() - start, 2)
-
         image = result.images[0]
         buf = io.BytesIO()
         image.save(buf, format="PNG")
         image_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
         return {
             "image_base64": image_base64,
             "width": width,
@@ -150,7 +102,6 @@ def handler(job):
             "seed": seed,
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
-            "dtype": TORCH_DTYPE_STR,
             "elapsed_seconds": elapsed,
         }
     except Exception as e:
